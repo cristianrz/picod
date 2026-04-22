@@ -1,0 +1,139 @@
+#!/bin/sh
+set -eu
+
+CONFIG_DIR="$HOME/.config/picod/user"
+STATE_DIR="$HOME/.local/picod"
+MULTI_USER="$CONFIG_DIR/multi-user.target.wants"
+
+mkdir -p "$CONFIG_DIR" "$STATE_DIR" "$MULTI_USER"
+
+# _pgrep PROCESS
+# Fallback for environments without pgrep. Uses grep -v to exclude the
+# grep process itself from results.
+_pgrep() {
+	ps -ef | grep "[${1%${1#?}]${1#?}" | awk '{ print $2 }'
+}
+
+# _is_running PID
+# Returns true if the process is alive.
+_is_running() {
+	[ -n "$1" ] && ps -p "$1" >/dev/null 2>&1
+}
+
+# get_field FIELD SERVICE
+get_field() {
+	field="$1"
+	service="$2"
+	awk -F'=' '/'"$field"'=/ { print $2 }' "$CONFIG_DIR/$service.service"
+}
+
+init() {
+	for service in "$MULTI_USER"/*; do
+		[ -e "$service" ] || continue
+		service="$(basename "$service" .service)"
+		picoctl start "$service"
+	done
+}
+
+start() {
+	service="$1"
+	pid_file="$STATE_DIR/$service"
+
+	# If a PID file exists, check if the process is actually alive
+	if [ -f "$pid_file" ]; then
+		pid="$(cat "$pid_file")"
+		if _is_running "$pid"; then
+			return
+		fi
+		# Stale PID file — process died unexpectedly
+		rm -f "$pid_file"
+	fi
+
+	cmd="$(get_field ExecStart "$service")"
+	[ -z "$cmd" ] && printf 'picoctl: no ExecStart in %s.service\n' "$service" >&2 && return 1
+
+	eval "$cmd" >> "$STATE_DIR/$service.log" 2>&1 &
+	echo "$!" > "$pid_file"
+}
+
+stop() {
+	service="$1"
+	pid_file="$STATE_DIR/$service"
+	cmd="$(get_field ExecStop "$service")"
+
+	if [ -z "$cmd" ]; then
+		if [ ! -f "$pid_file" ]; then
+			printf 'picoctl: %s is not running\n' "$service" >&2
+			return 1
+		fi
+		pid="$(cat "$pid_file")"
+		rm -f "$pid_file"
+		kill -15 "$pid"
+	else
+		eval "$cmd"
+		rm -f "$pid_file"
+	fi
+}
+
+status() {
+	service="$1"
+	cmd="$(get_field ExecStart "$service")"
+	description="$(get_field Description "$service")"
+	pid_file="$STATE_DIR/$service"
+
+	pid="$(cat "$pid_file" 2>/dev/null || true)"
+
+	if _is_running "$pid"; then
+		active="active (running)"
+		printf '\033[32m●\033[39m %s.service - %s\n' "$service" "$description"
+	else
+		active="inactive (dead)"
+		printf '● %s.service - %s\n' "$service" "$description"
+	fi
+
+	printf 'Active: %s\n' "$active"
+	printf 'Process: %s %s\n\n' "$pid" "$cmd"
+
+	if [ -f "$STATE_DIR/$service.log" ]; then
+		tail -n 5 "$STATE_DIR/$service.log"
+	fi
+}
+
+enable() {
+	service="$1"
+	ln -sv "$CONFIG_DIR/$service.service" "$MULTI_USER/$service.service"
+}
+
+disable() {
+	service="$1"
+	rm -v "$MULTI_USER/$service.service"
+}
+
+help() {
+	cat << 'EOF'
+usage: picoctl {command}
+  disable  removes enable mark
+  enable   marks a service to be started on init
+  init     starts all enabled services
+  restart  stops and starts the service
+  start    starts the service
+  status   shows status of service
+  stop     stops the service
+EOF
+}
+
+[ "$#" -eq 0 ] && help && exit 1
+
+action="$1"
+service="${2:-}"
+
+case "$action" in
+	disable) disable "$service" ;;
+	enable)  enable  "$service" ;;
+	init)    init ;;
+	restart) stop "$service"; start "$service" ;;
+	start)   start  "$service" ;;
+	status)  status "$service" ;;
+	stop)    stop   "$service" ;;
+	*)       help ;;
+esac
